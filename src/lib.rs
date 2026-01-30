@@ -1,0 +1,560 @@
+#![forbid(unsafe_code)]
+
+//! Deterministic Dubins path planning using integer arithmetic only.
+//!
+//! # Units
+//! - Positions and lengths use fixed-point integers with `SCALE = 1000`.
+//! - Angles are in milliradians (`Angle`), where 1000 = 1 rad.
+//! - The minimum turning radius (`rho`) uses the same fixed-point scale.
+//!
+//! This keeps all computations deterministic across architectures.
+
+use deterministic_trigonometry::DTrig;
+
+/// Fixed-point scale for distances and unitless values.
+pub const SCALE: i64 = 1000;
+
+/// Angle in milliradians (radians * 1000).
+pub type Angle = i32;
+
+/// Fixed-point distance or unitless value (scaled by `SCALE`).
+pub type Fixed = i64;
+
+/// 2 * PI in milliradians (approx).
+pub const TAU_MRAD: Angle = 6283;
+
+/// PI in milliradians (approx).
+pub const PI_MRAD: Angle = 3142;
+
+/// PI / 2 in milliradians (approx).
+pub const HALF_PI_MRAD: Angle = 1571;
+
+/// A pose in 2D with a heading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pose {
+    /// X position in fixed-point units.
+    pub x: Fixed,
+    /// Y position in fixed-point units.
+    pub y: Fixed,
+    /// Heading in milliradians.
+    pub heading: Angle,
+}
+
+impl Pose {
+    /// Creates a pose from fixed-point inputs.
+    pub fn new_fixed(x: Fixed, y: Fixed, heading: Angle) -> Self {
+        Self { x, y, heading: normalize_angle(heading) }
+    }
+
+    /// Creates a pose from integer units (scaled internally by `SCALE`).
+    pub fn new_units(x: i64, y: i64, heading: Angle) -> Self {
+        Self::new_fixed(x.saturating_mul(SCALE), y.saturating_mul(SCALE), heading)
+    }
+}
+
+/// Segment type for a Dubins path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentType {
+    Left,
+    Straight,
+    Right,
+}
+
+/// Dubins path family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathType {
+    LSL,
+    RSR,
+    LSR,
+    RSL,
+    RLR,
+    LRL,
+}
+
+/// One segment in a Dubins path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DubinsSegment {
+    /// Segment type.
+    pub kind: SegmentType,
+    /// Segment length in fixed-point units.
+    pub length: Fixed,
+}
+
+/// A deterministic Dubins path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DubinsPath {
+    /// Start pose for this path.
+    pub start: Pose,
+    /// Minimum turning radius in fixed-point units.
+    pub rho: Fixed,
+    /// Segment list in order.
+    pub segments: [DubinsSegment; 3],
+    /// Path family.
+    pub path_type: PathType,
+    /// Total path length in fixed-point units.
+    pub total_length: Fixed,
+}
+
+/// Errors for Dubins planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DubinsError {
+    /// Turning radius must be positive.
+    InvalidRadius,
+    /// No valid path found due to numeric issues.
+    NoPath,
+}
+
+/// Deterministic planner context with cached trigonometry tables.
+pub struct DubinsContext {
+    dtrig: DTrig,
+}
+
+impl Default for DubinsContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DubinsContext {
+    /// Creates a new deterministic context.
+    pub fn new() -> Self {
+        Self { dtrig: DTrig::initialize() }
+    }
+
+    /// Computes the shortest Dubins path between two poses.
+    pub fn shortest_path(
+        &self,
+        start: Pose,
+        end: Pose,
+        rho: Fixed,
+    ) -> Result<DubinsPath, DubinsError> {
+        let mut paths = self.all_paths(start, end, rho)?;
+        paths.sort_by_key(|path| path.total_length);
+        paths.into_iter().next().ok_or(DubinsError::NoPath)
+    }
+
+    /// Computes all feasible Dubins paths between two poses.
+    pub fn all_paths(
+        &self,
+        start: Pose,
+        end: Pose,
+        rho: Fixed,
+    ) -> Result<Vec<DubinsPath>, DubinsError> {
+        if rho <= 0 {
+            return Err(DubinsError::InvalidRadius);
+        }
+
+        let (alpha, beta, d) = normalized_inputs(start, end, rho, &self.dtrig);
+
+        let mut candidates = Vec::new();
+        if let Some(candidate) = dubins_lsl(alpha, beta, d, &self.dtrig) {
+            candidates.push(candidate);
+        }
+        if let Some(candidate) = dubins_rsr(alpha, beta, d, &self.dtrig) {
+            candidates.push(candidate);
+        }
+        if let Some(candidate) = dubins_lsr(alpha, beta, d, &self.dtrig) {
+            candidates.push(candidate);
+        }
+        if let Some(candidate) = dubins_rsl(alpha, beta, d, &self.dtrig) {
+            candidates.push(candidate);
+        }
+        if let Some(candidate) = dubins_rlr(alpha, beta, d, &self.dtrig) {
+            candidates.push(candidate);
+        }
+        if let Some(candidate) = dubins_lrl(alpha, beta, d, &self.dtrig) {
+            candidates.push(candidate);
+        }
+
+        if candidates.is_empty() {
+            return Err(DubinsError::NoPath);
+        }
+
+        Ok(candidates
+            .into_iter()
+            .map(|candidate| candidate.to_path(start, rho))
+            .collect())
+    }
+
+    /// Samples the path at a given arc-length.
+    pub fn sample(&self, path: &DubinsPath, distance: Fixed) -> Pose {
+        let mut remaining = distance.clamp(0, path.total_length);
+        let mut pose = path.start;
+
+        for segment in path.segments.iter() {
+            if remaining <= 0 {
+                break;
+            }
+            let step = remaining.min(segment.length);
+            pose = propagate_segment(pose, *segment, step, path.rho, &self.dtrig);
+            remaining -= step;
+        }
+
+        pose
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    path_type: PathType,
+    t: i64,
+    p: i64,
+    q: i64,
+}
+
+impl Candidate {
+    fn to_path(self, start: Pose, rho: Fixed) -> DubinsPath {
+        let segments = match self.path_type {
+            PathType::LSL => [SegmentType::Left, SegmentType::Straight, SegmentType::Left],
+            PathType::RSR => [SegmentType::Right, SegmentType::Straight, SegmentType::Right],
+            PathType::LSR => [SegmentType::Left, SegmentType::Straight, SegmentType::Right],
+            PathType::RSL => [SegmentType::Right, SegmentType::Straight, SegmentType::Left],
+            PathType::RLR => [SegmentType::Right, SegmentType::Left, SegmentType::Right],
+            PathType::LRL => [SegmentType::Left, SegmentType::Right, SegmentType::Left],
+        };
+
+        let values = [self.t, self.p, self.q];
+        let mut total_length = 0i64;
+        let mut built_segments = [DubinsSegment { kind: SegmentType::Straight, length: 0 }; 3];
+
+        for i in 0..3 {
+            let length = scaled_mul(rho, values[i]) / SCALE;
+            built_segments[i] = DubinsSegment { kind: segments[i], length };
+            total_length = total_length.saturating_add(length);
+        }
+
+        DubinsPath {
+            start,
+            rho,
+            segments: built_segments,
+            path_type: self.path_type,
+            total_length,
+        }
+    }
+}
+
+fn normalize_angle(angle: Angle) -> Angle {
+    mod2pi(angle as i64)
+}
+
+fn mod2pi(angle: i64) -> Angle {
+    let tau = TAU_MRAD as i64;
+    let mut value = angle % tau;
+    if value < 0 {
+        value += tau;
+    }
+    value as Angle
+}
+
+fn scaled_mul(a: i64, b: i64) -> i64 {
+    ((a as i128) * (b as i128)).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+fn normalized_inputs(start: Pose, end: Pose, rho: Fixed, dtrig: &DTrig) -> (Angle, Angle, Fixed) {
+    let dx = scaled_mul(end.x - start.x, SCALE) / rho;
+    let dy = scaled_mul(end.y - start.y, SCALE) / rho;
+    let d = isqrt_i128((dx as i128) * (dx as i128) + (dy as i128) * (dy as i128));
+    let theta = atan2_mrad(dy, dx, dtrig);
+    let alpha = mod2pi(start.heading as i64 - theta as i64);
+    let beta = mod2pi(end.heading as i64 - theta as i64);
+    (alpha, beta, d)
+}
+
+fn sin_mrad(angle: Angle, dtrig: &DTrig) -> i64 {
+    dtrig.sine((angle, 1000)).0 as i64
+}
+
+fn cos_mrad(angle: Angle, dtrig: &DTrig) -> i64 {
+    dtrig.cosine((angle, 1000)).0 as i64
+}
+
+fn atan2_mrad(y: i64, x: i64, dtrig: &DTrig) -> Angle {
+    if x == 0 && y == 0 {
+        return 0;
+    }
+    if x == 0 {
+        return if y > 0 { HALF_PI_MRAD } else { -HALF_PI_MRAD };
+    }
+    if y == 0 {
+        return if x > 0 { 0 } else { PI_MRAD };
+    }
+
+    let (num, den) = fit_i32_ratio(y, x);
+    let mut angle = dtrig.arctangent((num, den)).0;
+    if x < 0 {
+        if y >= 0 {
+            angle = angle.saturating_add(PI_MRAD);
+        } else {
+            angle = angle.saturating_sub(PI_MRAD);
+        }
+    }
+    angle
+}
+
+fn fit_i32_ratio(numer: i64, denom: i64) -> (i32, i32) {
+    let max_value = numer.abs().max(denom.abs());
+    if max_value == 0 {
+        return (0, 1);
+    }
+    if max_value <= i32::MAX as i64 {
+        return (numer as i32, denom as i32);
+    }
+    let scale = max_value / i32::MAX as i64 + 1;
+    ((numer / scale) as i32, (denom / scale) as i32)
+}
+
+fn arccos_mrad(value_scaled: i64, dtrig: &DTrig) -> Option<Angle> {
+    if value_scaled < -1000 || value_scaled > 1000 {
+        return None;
+    }
+    Some(dtrig.arccosine((value_scaled as i32, 1000)).0)
+}
+
+fn isqrt_i128(value: i128) -> i64 {
+    if value <= 0 {
+        return 0;
+    }
+    let mut x = value;
+    let mut y = (x + 1) >> 1;
+    while y < x {
+        x = y;
+        y = (x + value / x) >> 1;
+    }
+    x as i64
+}
+
+fn dubins_lsl(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
+    let sin_a = sin_mrad(alpha, dtrig);
+    let sin_b = sin_mrad(beta, dtrig);
+    let cos_a = cos_mrad(alpha, dtrig);
+    let cos_b = cos_mrad(beta, dtrig);
+    let cos_ab = cos_mrad(mod2pi(alpha as i64 - beta as i64), dtrig);
+
+    let tmp0 = d + sin_a - sin_b;
+    let p2 = 2 * SCALE * SCALE
+        + scaled_mul(d, d)
+        - 2 * cos_ab * SCALE
+        + 2 * d * (sin_a - sin_b);
+    if p2 < 0 {
+        return None;
+    }
+    let p = isqrt_i128(p2 as i128);
+    let tmp1 = atan2_mrad(cos_b - cos_a, tmp0, dtrig);
+    let t = mod2pi(-(alpha as i64) + tmp1 as i64);
+    let q = mod2pi(beta as i64 - tmp1 as i64);
+
+    Some(Candidate {
+        path_type: PathType::LSL,
+        t: t as i64,
+        p,
+        q: q as i64,
+    })
+}
+
+fn dubins_rsr(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
+    let sin_a = sin_mrad(alpha, dtrig);
+    let sin_b = sin_mrad(beta, dtrig);
+    let cos_a = cos_mrad(alpha, dtrig);
+    let cos_b = cos_mrad(beta, dtrig);
+    let cos_ab = cos_mrad(mod2pi(alpha as i64 - beta as i64), dtrig);
+
+    let tmp0 = d - sin_a + sin_b;
+    let p2 = 2 * SCALE * SCALE
+        + scaled_mul(d, d)
+        - 2 * cos_ab * SCALE
+        + 2 * d * (sin_b - sin_a);
+    if p2 < 0 {
+        return None;
+    }
+    let p = isqrt_i128(p2 as i128);
+    let tmp1 = atan2_mrad(cos_a - cos_b, tmp0, dtrig);
+    let t = mod2pi(alpha as i64 - tmp1 as i64);
+    let q = mod2pi(-(beta as i64) + tmp1 as i64);
+
+    Some(Candidate {
+        path_type: PathType::RSR,
+        t: t as i64,
+        p,
+        q: q as i64,
+    })
+}
+
+fn dubins_lsr(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
+    let sin_a = sin_mrad(alpha, dtrig);
+    let sin_b = sin_mrad(beta, dtrig);
+    let cos_a = cos_mrad(alpha, dtrig);
+    let cos_b = cos_mrad(beta, dtrig);
+    let cos_ab = cos_mrad(mod2pi(alpha as i64 - beta as i64), dtrig);
+
+    let p2 = -2 * SCALE * SCALE
+        + scaled_mul(d, d)
+        + 2 * cos_ab * SCALE
+        + 2 * d * (sin_a + sin_b);
+    if p2 < 0 {
+        return None;
+    }
+    let p = isqrt_i128(p2 as i128);
+    let tmp2 = atan2_mrad(-cos_a - cos_b, d + sin_a + sin_b, dtrig);
+    let tmp3 = atan2_mrad(-2 * SCALE, p, dtrig);
+    let t = mod2pi(-(alpha as i64) + (tmp2 as i64 - tmp3 as i64));
+    let q = mod2pi(-(beta as i64) + (tmp2 as i64 - tmp3 as i64));
+
+    Some(Candidate {
+        path_type: PathType::LSR,
+        t: t as i64,
+        p,
+        q: q as i64,
+    })
+}
+
+fn dubins_rsl(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
+    let sin_a = sin_mrad(alpha, dtrig);
+    let sin_b = sin_mrad(beta, dtrig);
+    let cos_a = cos_mrad(alpha, dtrig);
+    let cos_b = cos_mrad(beta, dtrig);
+    let cos_ab = cos_mrad(mod2pi(alpha as i64 - beta as i64), dtrig);
+
+    let p2 = -2 * SCALE * SCALE
+        + scaled_mul(d, d)
+        + 2 * cos_ab * SCALE
+        - 2 * d * (sin_a + sin_b);
+    if p2 < 0 {
+        return None;
+    }
+    let p = isqrt_i128(p2 as i128);
+    let tmp2 = atan2_mrad(cos_a + cos_b, d - sin_a - sin_b, dtrig);
+    let tmp3 = atan2_mrad(2 * SCALE, p, dtrig);
+    let t = mod2pi(alpha as i64 - (tmp2 as i64 - tmp3 as i64));
+    let q = mod2pi(beta as i64 - (tmp2 as i64 - tmp3 as i64));
+
+    Some(Candidate {
+        path_type: PathType::RSL,
+        t: t as i64,
+        p,
+        q: q as i64,
+    })
+}
+
+fn dubins_rlr(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
+    let sin_a = sin_mrad(alpha, dtrig);
+    let sin_b = sin_mrad(beta, dtrig);
+    let cos_a = cos_mrad(alpha, dtrig);
+    let cos_b = cos_mrad(beta, dtrig);
+    let cos_ab = cos_mrad(mod2pi(alpha as i64 - beta as i64), dtrig);
+
+    let numerator = 6 * SCALE * SCALE
+        - scaled_mul(d, d)
+        + 2 * cos_ab * SCALE
+        + 2 * d * (sin_a - sin_b);
+    let tmp0 = numerator / 8000;
+    let acos = arccos_mrad(tmp0, dtrig)?;
+    let p = mod2pi(TAU_MRAD as i64 - acos as i64) as i64;
+    let tmp1 = atan2_mrad(cos_a - cos_b, d - sin_a + sin_b, dtrig);
+    let t = mod2pi(alpha as i64 - tmp1 as i64 + p / 2) as i64;
+    let q = mod2pi(alpha as i64 - beta as i64 - t + p) as i64;
+
+    Some(Candidate {
+        path_type: PathType::RLR,
+        t,
+        p,
+        q,
+    })
+}
+
+fn dubins_lrl(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
+    let sin_a = sin_mrad(alpha, dtrig);
+    let sin_b = sin_mrad(beta, dtrig);
+    let cos_a = cos_mrad(alpha, dtrig);
+    let cos_b = cos_mrad(beta, dtrig);
+    let cos_ab = cos_mrad(mod2pi(alpha as i64 - beta as i64), dtrig);
+
+    let numerator = 6 * SCALE * SCALE
+        - scaled_mul(d, d)
+        + 2 * cos_ab * SCALE
+        + 2 * d * (sin_b - sin_a);
+    let tmp0 = numerator / 8000;
+    let acos = arccos_mrad(tmp0, dtrig)?;
+    let p = mod2pi(TAU_MRAD as i64 - acos as i64) as i64;
+    let tmp1 = atan2_mrad(cos_a - cos_b, d + sin_a - sin_b, dtrig);
+    let t = mod2pi(-(alpha as i64) - tmp1 as i64 + p / 2) as i64;
+    let q = mod2pi(beta as i64 - alpha as i64 - t + p) as i64;
+
+    Some(Candidate {
+        path_type: PathType::LRL,
+        t,
+        p,
+        q,
+    })
+}
+
+fn propagate_segment(
+    pose: Pose,
+    segment: DubinsSegment,
+    distance: Fixed,
+    rho: Fixed,
+    dtrig: &DTrig,
+) -> Pose {
+    match segment.kind {
+        SegmentType::Straight => {
+            let cos_h = cos_mrad(pose.heading, dtrig);
+            let sin_h = sin_mrad(pose.heading, dtrig);
+            let dx = scaled_mul(cos_h, distance) / SCALE;
+            let dy = scaled_mul(sin_h, distance) / SCALE;
+            Pose::new_fixed(pose.x + dx, pose.y + dy, pose.heading)
+        }
+        SegmentType::Left => {
+            let angle = scaled_mul(distance, SCALE) / rho;
+            let new_heading = mod2pi(pose.heading as i64 + angle as i64);
+            let sin0 = sin_mrad(pose.heading, dtrig);
+            let cos0 = cos_mrad(pose.heading, dtrig);
+            let sin1 = sin_mrad(new_heading, dtrig);
+            let cos1 = cos_mrad(new_heading, dtrig);
+            let dx = scaled_mul(rho, sin1 - sin0) / SCALE;
+            let dy = scaled_mul(rho, cos0 - cos1) / SCALE;
+            Pose::new_fixed(pose.x + dx, pose.y + dy, new_heading)
+        }
+        SegmentType::Right => {
+            let angle = scaled_mul(distance, SCALE) / rho;
+            let new_heading = mod2pi(pose.heading as i64 - angle as i64);
+            let sin0 = sin_mrad(pose.heading, dtrig);
+            let cos0 = cos_mrad(pose.heading, dtrig);
+            let sin1 = sin_mrad(new_heading, dtrig);
+            let cos1 = cos_mrad(new_heading, dtrig);
+            let dx = scaled_mul(rho, sin0 - sin1) / SCALE;
+            let dy = scaled_mul(rho, cos1 - cos0) / SCALE;
+            Pose::new_fixed(pose.x + dx, pose.y + dy, new_heading)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn straight_line_path() {
+        let ctx = DubinsContext::new();
+        let start = Pose::new_units(0, 0, 0);
+        let end = Pose::new_units(10, 0, 0);
+        let rho = 1 * SCALE;
+        let path = ctx.shortest_path(start, end, rho).unwrap();
+        assert_eq!(path.total_length, 10 * SCALE);
+        let end_pose = ctx.sample(&path, path.total_length);
+        assert!((end_pose.x - end.x).abs() <= 1);
+        assert!((end_pose.y - end.y).abs() <= 1);
+        assert_eq!(end_pose.heading, end.heading);
+    }
+
+    #[test]
+    fn offset_turn_path_reaches_goal() {
+        let ctx = DubinsContext::new();
+        let start = Pose::new_units(0, 0, 0);
+        let end = Pose::new_units(6, 6, HALF_PI_MRAD);
+        let rho = 2 * SCALE;
+        let path = ctx.shortest_path(start, end, rho).unwrap();
+        let end_pose = ctx.sample(&path, path.total_length);
+        assert!((end_pose.x - end.x).abs() <= 5);
+        assert!((end_pose.y - end.y).abs() <= 5);
+        assert_eq!(end_pose.heading, end.heading);
+    }
+}
