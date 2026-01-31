@@ -29,6 +29,24 @@ pub const PI_MRAD: Angle = 3142;
 /// PI / 2 in milliradians (approx).
 pub const HALF_PI_MRAD: Angle = 1571;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FixedVec2 {
+    pub x: Fixed,
+    pub y: Fixed,
+}
+
+impl FixedVec2 {
+    pub fn new(x: Fixed, y: Fixed) -> Self {
+        Self { x, y }
+    }
+
+    pub fn distance(self, other: Self) -> Fixed {
+        let dx = (other.x - self.x) as i128;
+        let dy = (other.y - self.y) as i128;
+        isqrt_i128(dx * dx + dy * dy)
+    }
+}
+
 /// A pose in 2D with a heading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Pose {
@@ -195,11 +213,11 @@ impl DubinsContext {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Candidate {
-    path_type: PathType,
-    t: i64,
-    p: i64,
-    q: i64,
+pub struct Candidate {
+    pub path_type: PathType,
+    pub t: i64,
+    pub p: i64,
+    pub q: i64,
 }
 
 impl Candidate {
@@ -233,11 +251,11 @@ impl Candidate {
     }
 }
 
-fn normalize_angle(angle: Angle) -> Angle {
+pub fn normalize_angle(angle: Angle) -> Angle {
     mod2pi(angle as i64)
 }
 
-fn mod2pi(angle: i64) -> Angle {
+pub fn mod2pi(angle: i64) -> Angle {
     let tau = TAU_MRAD as i64;
     let mut value = angle % tau;
     if value < 0 {
@@ -246,11 +264,11 @@ fn mod2pi(angle: i64) -> Angle {
     value as Angle
 }
 
-fn scaled_mul(a: i64, b: i64) -> i64 {
+pub fn scaled_mul(a: i64, b: i64) -> i64 {
     ((a as i128) * (b as i128)).clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
-fn normalized_inputs(start: Pose, end: Pose, rho: Fixed, dtrig: &DTrig) -> (Angle, Angle, Fixed) {
+pub fn normalized_inputs(start: Pose, end: Pose, rho: Fixed, dtrig: &DTrig) -> (Angle, Angle, Fixed) {
     let dx = scaled_mul(end.x - start.x, SCALE) / rho;
     let dy = scaled_mul(end.y - start.y, SCALE) / rho;
     let d = isqrt_i128((dx as i128) * (dx as i128) + (dy as i128) * (dy as i128));
@@ -260,15 +278,15 @@ fn normalized_inputs(start: Pose, end: Pose, rho: Fixed, dtrig: &DTrig) -> (Angl
     (alpha, beta, d)
 }
 
-fn sin_mrad(angle: Angle, dtrig: &DTrig) -> i64 {
+pub fn sin_mrad(angle: Angle, dtrig: &DTrig) -> i64 {
     dtrig.sine((angle, 1000)).0 as i64
 }
 
-fn cos_mrad(angle: Angle, dtrig: &DTrig) -> i64 {
+pub fn cos_mrad(angle: Angle, dtrig: &DTrig) -> i64 {
     dtrig.cosine((angle, 1000)).0 as i64
 }
 
-fn atan2_mrad(y: i64, x: i64, dtrig: &DTrig) -> Angle {
+pub fn atan2_mrad(y: Fixed, x: Fixed, dtrig: &DTrig) -> Angle {
     if x == 0 && y == 0 {
         return 0;
     }
@@ -291,7 +309,7 @@ fn atan2_mrad(y: i64, x: i64, dtrig: &DTrig) -> Angle {
     angle
 }
 
-fn fit_i32_ratio(numer: i64, denom: i64) -> (i32, i32) {
+pub fn fit_i32_ratio(numer: i64, denom: i64) -> (i32, i32) {
     let max_value = numer.abs().max(denom.abs());
     if max_value == 0 {
         return (0, 1);
@@ -303,14 +321,14 @@ fn fit_i32_ratio(numer: i64, denom: i64) -> (i32, i32) {
     ((numer / scale) as i32, (denom / scale) as i32)
 }
 
-fn arccos_mrad(value_scaled: i64, dtrig: &DTrig) -> Option<Angle> {
+pub fn arccos_mrad(value_scaled: i64, dtrig: &DTrig) -> Option<Angle> {
     if value_scaled < -1000 || value_scaled > 1000 {
         return None;
     }
     Some(dtrig.arccosine((value_scaled as i32, 1000)).0)
 }
 
-fn isqrt_i128(value: i128) -> i64 {
+pub fn isqrt_i128(value: i128) -> i64 {
     if value <= 0 {
         return 0;
     }
@@ -323,7 +341,7 @@ fn isqrt_i128(value: i128) -> i64 {
     x as i64
 }
 
-fn dubins_lsl(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
+pub fn dubins_lsl(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
     let sin_a = sin_mrad(alpha, dtrig);
     let sin_b = sin_mrad(beta, dtrig);
     let cos_a = cos_mrad(alpha, dtrig);
@@ -351,7 +369,7 @@ fn dubins_lsl(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Cand
     })
 }
 
-fn dubins_rsr(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
+pub fn dubins_rsr(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
     let sin_a = sin_mrad(alpha, dtrig);
     let sin_b = sin_mrad(beta, dtrig);
     let cos_a = cos_mrad(alpha, dtrig);
@@ -379,7 +397,7 @@ fn dubins_rsr(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Cand
     })
 }
 
-fn dubins_lsr(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
+pub fn dubins_lsr(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
     let sin_a = sin_mrad(alpha, dtrig);
     let sin_b = sin_mrad(beta, dtrig);
     let cos_a = cos_mrad(alpha, dtrig);
@@ -407,7 +425,7 @@ fn dubins_lsr(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Cand
     })
 }
 
-fn dubins_rsl(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
+pub fn dubins_rsl(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
     let sin_a = sin_mrad(alpha, dtrig);
     let sin_b = sin_mrad(beta, dtrig);
     let cos_a = cos_mrad(alpha, dtrig);
@@ -435,7 +453,7 @@ fn dubins_rsl(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Cand
     })
 }
 
-fn dubins_rlr(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
+pub fn dubins_rlr(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
     let sin_a = sin_mrad(alpha, dtrig);
     let sin_b = sin_mrad(beta, dtrig);
     let cos_a = cos_mrad(alpha, dtrig);
@@ -461,7 +479,7 @@ fn dubins_rlr(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Cand
     })
 }
 
-fn dubins_lrl(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
+pub fn dubins_lrl(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Candidate> {
     let sin_a = sin_mrad(alpha, dtrig);
     let sin_b = sin_mrad(beta, dtrig);
     let cos_a = cos_mrad(alpha, dtrig);
@@ -487,7 +505,7 @@ fn dubins_lrl(alpha: Angle, beta: Angle, d: Fixed, dtrig: &DTrig) -> Option<Cand
     })
 }
 
-fn propagate_segment(
+pub fn propagate_segment(
     pose: Pose,
     segment: DubinsSegment,
     distance: Fixed,
@@ -557,4 +575,70 @@ mod tests {
         assert!((end_pose.y - end.y).abs() <= 5);
         assert_eq!(end_pose.heading, end.heading);
     }
+}
+
+pub fn sample_path_range(
+    dubins: &DubinsContext,
+    path: &DubinsPath,
+    step: Fixed,
+    start: Fixed,
+    end: Fixed,
+) -> Vec<FixedVec2> {
+    let mut points = Vec::new();
+    if step <= 0 || end < start {
+        return points;
+    }
+    let mut distance = start;
+    while distance < end {
+        let pose = dubins.sample(path, distance);
+        points.push(FixedVec2::new(pose.x, pose.y));
+        distance = distance.saturating_add(step);
+    }
+    let pose = dubins.sample(path, end);
+    points.push(FixedVec2::new(pose.x, pose.y));
+    points
+}
+
+pub fn fixed_from_f32(value: f32) -> Fixed {
+    (value * SCALE as f32).round() as Fixed
+}
+
+pub fn fixed_to_f32(value: Fixed) -> f32 {
+    value as f32 / SCALE as f32
+}
+
+pub fn angle_to_f32(angle: Angle) -> f32 {
+    angle as f32 / 1000.0
+}
+
+pub fn unit_vector_mrad(angle: Angle, dtrig: &DTrig) -> (Fixed, Fixed) {
+    let sin = dtrig.sine((angle, 1000)).0 as i64;
+    let cos = dtrig.cosine((angle, 1000)).0 as i64;
+    (cos, sin)
+}
+
+pub fn fixed_from_angle(center: FixedVec2, radius: Fixed, angle: Angle, dtrig: &DTrig) -> FixedVec2 {
+    let (cos, sin) = unit_vector_mrad(angle, dtrig);
+    let dx = scaled_mul_i64(radius, cos) / SCALE;
+    let dy = scaled_mul_i64(radius, sin) / SCALE;
+    FixedVec2::new(center.x + dx, center.y + dy)
+}
+
+pub fn scaled_mul_i64(a: i64, b: i64) -> i64 {
+    ((a as i128) * (b as i128)).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+pub fn mul_div(a: i64, b: i64, denom: i64) -> i64 {
+    if denom == 0 {
+        return 0;
+    }
+    ((a as i128) * (b as i128) / (denom as i128)) as i64
+}
+
+pub fn angular_delta(speed: Fixed, radius: Fixed, dt_micros: i64, micros_per_sec: i64) -> Angle {
+    if radius <= 0 {
+        return 0;
+    }
+    let omega_mrad = mul_div(speed, 1000, radius);
+    mul_div(omega_mrad, dt_micros, micros_per_sec) as Angle
 }
