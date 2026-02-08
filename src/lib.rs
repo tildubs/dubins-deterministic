@@ -413,6 +413,9 @@ impl DubinsContext {
 
         let start_point = FixedVec2::new(start.x, start.y);
         let angles = tangent_angles_point_circle(start_point, circle, &self.dtrig);
+        if angles.is_empty() {
+            return self.shortest_path_pose_to_circle_grid(start, circle, rho, options);
+        }
         let mut best: Option<PoseToCircleResult> = None;
         for angle in angles {
             if options.allow_clockwise {
@@ -458,6 +461,9 @@ impl DubinsContext {
 
         let end_point = FixedVec2::new(end.x, end.y);
         let angles = tangent_angles_point_circle(end_point, circle, &self.dtrig);
+        if angles.is_empty() {
+            return self.shortest_path_circle_to_pose_grid(circle, end, rho, options);
+        }
         let mut best: Option<CircleToPoseResult> = None;
         for angle in angles {
             if options.allow_clockwise {
@@ -502,6 +508,14 @@ impl DubinsContext {
         }
 
         let tangents = circle_circle_tangents(start_circle, end_circle);
+        if tangents.is_empty() {
+            return self.shortest_path_circle_to_circle_grid(
+                start_circle,
+                end_circle,
+                rho,
+                options,
+            );
+        }
         let mut best: Option<CircleToCircleResult> = None;
 
         for tangent in tangents {

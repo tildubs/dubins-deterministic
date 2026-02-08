@@ -10,7 +10,7 @@ checksum = "970dec1b85309fe998b798317b1c221ff48daf5c174c2bfa539f49db1597796e"
 
 [[package]]
 name = "dubins-deterministic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "deterministic-trigonometry",
 ]
