@@ -277,7 +277,7 @@ impl DubinsContext {
         let mut best: Option<PoseToCircleResult> = None;
         let step = options.angle_step as usize;
         for angle in (0..TAU_MRAD).step_by(step) {
-            if options.allow_clockwise {
+            if options.end_allow_clockwise {
                 best = select_best_pose_to_circle(
                     best,
                     self,
@@ -288,7 +288,7 @@ impl DubinsContext {
                     rho,
                 );
             }
-            if options.allow_counterclockwise {
+            if options.end_allow_counterclockwise {
                 best = select_best_pose_to_circle(
                     best,
                     self,
@@ -321,7 +321,7 @@ impl DubinsContext {
         let mut best: Option<CircleToPoseResult> = None;
         let step = options.angle_step as usize;
         for angle in (0..TAU_MRAD).step_by(step) {
-            if options.allow_clockwise {
+            if options.start_allow_clockwise {
                 best = select_best_circle_to_pose(
                     best,
                     self,
@@ -332,7 +332,7 @@ impl DubinsContext {
                     rho,
                 );
             }
-            if options.allow_counterclockwise {
+            if options.start_allow_counterclockwise {
                 best = select_best_circle_to_pose(
                     best,
                     self,
@@ -405,9 +405,7 @@ impl DubinsContext {
         if circle.radius <= 0 || rho <= 0 {
             return Err(DubinsError::InvalidRadius);
         }
-        if (!options.start_allow_clockwise && !options.start_allow_counterclockwise)
-            || (!options.end_allow_clockwise && !options.end_allow_counterclockwise)
-        {
+        if !options.end_allow_clockwise && !options.end_allow_counterclockwise {
             return Err(DubinsError::NoPath);
         }
 
@@ -418,7 +416,7 @@ impl DubinsContext {
         }
         let mut best: Option<PoseToCircleResult> = None;
         for angle in angles {
-            if options.allow_clockwise {
+            if options.end_allow_clockwise {
                 best = select_best_pose_to_circle(
                     best,
                     self,
@@ -429,7 +427,7 @@ impl DubinsContext {
                     rho,
                 );
             }
-            if options.allow_counterclockwise {
+            if options.end_allow_counterclockwise {
                 best = select_best_pose_to_circle(
                     best,
                     self,
@@ -455,7 +453,7 @@ impl DubinsContext {
         if circle.radius <= 0 || rho <= 0 {
             return Err(DubinsError::InvalidRadius);
         }
-        if !options.allow_clockwise && !options.allow_counterclockwise {
+        if !options.start_allow_clockwise && !options.start_allow_counterclockwise {
             return Err(DubinsError::NoPath);
         }
 
@@ -466,7 +464,7 @@ impl DubinsContext {
         }
         let mut best: Option<CircleToPoseResult> = None;
         for angle in angles {
-            if options.allow_clockwise {
+            if options.start_allow_clockwise {
                 best = select_best_circle_to_pose(
                     best,
                     self,
@@ -477,7 +475,7 @@ impl DubinsContext {
                     rho,
                 );
             }
-            if options.allow_counterclockwise {
+            if options.start_allow_counterclockwise {
                 best = select_best_circle_to_pose(
                     best,
                     self,
@@ -503,7 +501,9 @@ impl DubinsContext {
         if start_circle.radius <= 0 || end_circle.radius <= 0 || rho <= 0 {
             return Err(DubinsError::InvalidRadius);
         }
-        if !options.allow_clockwise && !options.allow_counterclockwise {
+        if (!options.start_allow_clockwise && !options.start_allow_counterclockwise)
+            || (!options.end_allow_clockwise && !options.end_allow_counterclockwise)
+        {
             return Err(DubinsError::NoPath);
         }
 
