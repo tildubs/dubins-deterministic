@@ -341,8 +341,64 @@ impl DubinsContext {
         best.ok_or(DubinsError::NoPath)
     }
 
-    /// Shortest path between two circular manifolds (tangent-to-tangent, grid search).
+    /// Shortest path between two circular manifolds (tangent-to-tangent, 1D grid search).
     pub fn shortest_path_circle_to_circle_grid(
+        &self,
+        start_circle: CircleManifold,
+        end_circle: CircleManifold,
+        rho: Fixed,
+        options: ManifoldSearchOptions,
+    ) -> Result<CircleToCircleResult, DubinsError> {
+        if start_circle.radius <= 0 || end_circle.radius <= 0 || rho <= 0 {
+            return Err(DubinsError::InvalidRadius);
+        }
+        if options.angle_step <= 0 {
+            return Err(DubinsError::InvalidStep);
+        }
+
+        let mut best: Option<CircleToCircleResult> = None;
+        let step = options.angle_step as usize;
+        let directions = [TangentDirection::Clockwise, TangentDirection::Counterclockwise];
+
+        for start_angle in (0..TAU_MRAD).step_by(step) {
+            for start_dir in directions {
+                if !start_dir_allowed(start_dir, options) {
+                    continue;
+                }
+
+                let start_pose = circle_tangent_pose(start_circle, start_angle, start_dir, &self.dtrig);
+                let start_point = FixedVec2::new(start_pose.x, start_pose.y);
+                let end_angles = tangent_angles_point_circle(start_point, end_circle, &self.dtrig);
+                if end_angles.is_empty() {
+                    continue;
+                }
+
+                for end_angle in end_angles {
+                    for end_dir in directions {
+                        if !end_dir_allowed(end_dir, options) {
+                            continue;
+                        }
+                        best = select_best_circle_to_circle(
+                            best,
+                            self,
+                            start_circle,
+                            end_circle,
+                            start_angle,
+                            end_angle,
+                            start_dir,
+                            end_dir,
+                            rho,
+                        );
+                    }
+                }
+            }
+        }
+
+        best.ok_or(DubinsError::NoPath)
+    }
+
+    /// Shortest path between two circular manifolds (tangent-to-tangent, 2D grid search).
+    pub fn shortest_path_circle_to_circle_grid_2d(
         &self,
         start_circle: CircleManifold,
         end_circle: CircleManifold,
