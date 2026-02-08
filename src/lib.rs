@@ -52,6 +52,14 @@ pub struct ManifoldSearchOptions {
     pub allow_clockwise: bool,
     /// Whether to consider counterclockwise tangents.
     pub allow_counterclockwise: bool,
+    /// Whether to consider clockwise tangents on the start circle.
+    pub start_allow_clockwise: bool,
+    /// Whether to consider counterclockwise tangents on the start circle.
+    pub start_allow_counterclockwise: bool,
+    /// Whether to consider clockwise tangents on the end circle.
+    pub end_allow_clockwise: bool,
+    /// Whether to consider counterclockwise tangents on the end circle.
+    pub end_allow_counterclockwise: bool,
 }
 
 impl Default for ManifoldSearchOptions {
@@ -60,6 +68,10 @@ impl Default for ManifoldSearchOptions {
             angle_step: 10,
             allow_clockwise: true,
             allow_counterclockwise: true,
+            start_allow_clockwise: true,
+            start_allow_counterclockwise: true,
+            end_allow_clockwise: true,
+            end_allow_counterclockwise: true,
         }
     }
 }
@@ -357,11 +369,11 @@ impl DubinsContext {
         for start_angle in (0..TAU_MRAD).step_by(step) {
             for end_angle in (0..TAU_MRAD).step_by(step) {
                 for start_dir in directions {
-                    if !dir_allowed(start_dir, options) {
+                    if !start_dir_allowed(start_dir, options) {
                         continue;
                     }
                     for end_dir in directions {
-                        if !dir_allowed(end_dir, options) {
+                        if !end_dir_allowed(end_dir, options) {
                             continue;
                         }
                         best = select_best_circle_to_circle(
@@ -393,7 +405,9 @@ impl DubinsContext {
         if circle.radius <= 0 || rho <= 0 {
             return Err(DubinsError::InvalidRadius);
         }
-        if !options.allow_clockwise && !options.allow_counterclockwise {
+        if (!options.start_allow_clockwise && !options.start_allow_counterclockwise)
+            || (!options.end_allow_clockwise && !options.end_allow_counterclockwise)
+        {
             return Err(DubinsError::NoPath);
         }
 
@@ -491,8 +505,8 @@ impl DubinsContext {
         let mut best: Option<CircleToCircleResult> = None;
 
         for tangent in tangents {
-            if !dir_allowed(tangent.start_direction, options)
-                || !dir_allowed(tangent.end_direction, options)
+            if !start_dir_allowed(tangent.start_direction, options)
+                || !end_dir_allowed(tangent.end_direction, options)
             {
                 continue;
             }
@@ -579,10 +593,17 @@ struct CircleTangentCandidate {
     end_direction: TangentDirection,
 }
 
-fn dir_allowed(direction: TangentDirection, options: ManifoldSearchOptions) -> bool {
+fn start_dir_allowed(direction: TangentDirection, options: ManifoldSearchOptions) -> bool {
     match direction {
-        TangentDirection::Clockwise => options.allow_clockwise,
-        TangentDirection::Counterclockwise => options.allow_counterclockwise,
+        TangentDirection::Clockwise => options.start_allow_clockwise,
+        TangentDirection::Counterclockwise => options.start_allow_counterclockwise,
+    }
+}
+
+fn end_dir_allowed(direction: TangentDirection, options: ManifoldSearchOptions) -> bool {
+    match direction {
+        TangentDirection::Clockwise => options.end_allow_clockwise,
+        TangentDirection::Counterclockwise => options.end_allow_counterclockwise,
     }
 }
 
