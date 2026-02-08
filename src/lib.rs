@@ -48,10 +48,6 @@ pub enum TangentDirection {
 pub struct ManifoldSearchOptions {
     /// Angle step in milliradians.
     pub angle_step: Angle,
-    /// Whether to consider clockwise tangents.
-    pub allow_clockwise: bool,
-    /// Whether to consider counterclockwise tangents.
-    pub allow_counterclockwise: bool,
     /// Whether to consider clockwise tangents on the start circle.
     pub start_allow_clockwise: bool,
     /// Whether to consider counterclockwise tangents on the start circle.
@@ -66,8 +62,6 @@ impl Default for ManifoldSearchOptions {
     fn default() -> Self {
         Self {
             angle_step: 10,
-            allow_clockwise: true,
-            allow_counterclockwise: true,
             start_allow_clockwise: true,
             start_allow_counterclockwise: true,
             end_allow_clockwise: true,
