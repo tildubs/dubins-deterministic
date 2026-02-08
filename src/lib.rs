@@ -29,6 +29,40 @@ pub const PI_MRAD: Angle = 3142;
 /// PI / 2 in milliradians (approx).
 pub const HALF_PI_MRAD: Angle = 1571;
 
+/// Circular manifold (center + radius).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CircleManifold {
+    pub center: FixedVec2,
+    pub radius: Fixed,
+}
+
+/// Tangent direction relative to the circle (clockwise or counterclockwise).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TangentDirection {
+    Clockwise,
+    Counterclockwise,
+}
+
+/// Options for manifold search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManifoldSearchOptions {
+    /// Angle step in milliradians.
+    pub angle_step: Angle,
+    /// Whether to consider clockwise tangents.
+    pub allow_clockwise: bool,
+    /// Whether to consider counterclockwise tangents.
+    pub allow_counterclockwise: bool,
+}
+
+impl Default for ManifoldSearchOptions {
+    fn default() -> Self {
+        Self {
+            angle_step: 10,
+            allow_clockwise: true,
+            allow_counterclockwise: true,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FixedVec2 {
     pub x: Fixed,
@@ -118,6 +152,8 @@ pub struct DubinsPath {
 pub enum DubinsError {
     /// Turning radius must be positive.
     InvalidRadius,
+    /// Angle step must be positive.
+    InvalidStep,
     /// No valid path found due to numeric issues.
     NoPath,
 }
@@ -209,6 +245,563 @@ impl DubinsContext {
         }
 
         pose
+    }
+
+    /// Shortest path from a pose to a tangent point on a circle (grid search).
+    pub fn shortest_path_pose_to_circle_grid(
+        &self,
+        start: Pose,
+        circle: CircleManifold,
+        rho: Fixed,
+        options: ManifoldSearchOptions,
+    ) -> Result<PoseToCircleResult, DubinsError> {
+        if circle.radius <= 0 || rho <= 0 {
+            return Err(DubinsError::InvalidRadius);
+        }
+        if options.angle_step <= 0 {
+            return Err(DubinsError::InvalidStep);
+        }
+
+        let mut best: Option<PoseToCircleResult> = None;
+        let step = options.angle_step as usize;
+        for angle in (0..TAU_MRAD).step_by(step) {
+            if options.allow_clockwise {
+                best = select_best_pose_to_circle(
+                    best,
+                    self,
+                    start,
+                    circle,
+                    angle,
+                    TangentDirection::Clockwise,
+                    rho,
+                );
+            }
+            if options.allow_counterclockwise {
+                best = select_best_pose_to_circle(
+                    best,
+                    self,
+                    start,
+                    circle,
+                    angle,
+                    TangentDirection::Counterclockwise,
+                    rho,
+                );
+            }
+        }
+        best.ok_or(DubinsError::NoPath)
+    }
+
+    /// Shortest path from a circle tangent start to a pose (grid search).
+    pub fn shortest_path_circle_to_pose_grid(
+        &self,
+        circle: CircleManifold,
+        end: Pose,
+        rho: Fixed,
+        options: ManifoldSearchOptions,
+    ) -> Result<CircleToPoseResult, DubinsError> {
+        if circle.radius <= 0 || rho <= 0 {
+            return Err(DubinsError::InvalidRadius);
+        }
+        if options.angle_step <= 0 {
+            return Err(DubinsError::InvalidStep);
+        }
+
+        let mut best: Option<CircleToPoseResult> = None;
+        let step = options.angle_step as usize;
+        for angle in (0..TAU_MRAD).step_by(step) {
+            if options.allow_clockwise {
+                best = select_best_circle_to_pose(
+                    best,
+                    self,
+                    circle,
+                    end,
+                    angle,
+                    TangentDirection::Clockwise,
+                    rho,
+                );
+            }
+            if options.allow_counterclockwise {
+                best = select_best_circle_to_pose(
+                    best,
+                    self,
+                    circle,
+                    end,
+                    angle,
+                    TangentDirection::Counterclockwise,
+                    rho,
+                );
+            }
+        }
+        best.ok_or(DubinsError::NoPath)
+    }
+
+    /// Shortest path between two circular manifolds (tangent-to-tangent, grid search).
+    pub fn shortest_path_circle_to_circle_grid(
+        &self,
+        start_circle: CircleManifold,
+        end_circle: CircleManifold,
+        rho: Fixed,
+        options: ManifoldSearchOptions,
+    ) -> Result<CircleToCircleResult, DubinsError> {
+        if start_circle.radius <= 0 || end_circle.radius <= 0 || rho <= 0 {
+            return Err(DubinsError::InvalidRadius);
+        }
+        if options.angle_step <= 0 {
+            return Err(DubinsError::InvalidStep);
+        }
+
+        let mut best: Option<CircleToCircleResult> = None;
+        let step = options.angle_step as usize;
+        let directions = [TangentDirection::Clockwise, TangentDirection::Counterclockwise];
+
+        for start_angle in (0..TAU_MRAD).step_by(step) {
+            for end_angle in (0..TAU_MRAD).step_by(step) {
+                for start_dir in directions {
+                    if !dir_allowed(start_dir, options) {
+                        continue;
+                    }
+                    for end_dir in directions {
+                        if !dir_allowed(end_dir, options) {
+                            continue;
+                        }
+                        best = select_best_circle_to_circle(
+                            best,
+                            self,
+                            start_circle,
+                            end_circle,
+                            start_angle,
+                            end_angle,
+                            start_dir,
+                            end_dir,
+                            rho,
+                        );
+                    }
+                }
+            }
+        }
+        best.ok_or(DubinsError::NoPath)
+    }
+
+    /// Shortest path from a pose to a tangent point on a circle (analytic tangents).
+    pub fn shortest_path_pose_to_circle_analytic(
+        &self,
+        start: Pose,
+        circle: CircleManifold,
+        rho: Fixed,
+        options: ManifoldSearchOptions,
+    ) -> Result<PoseToCircleResult, DubinsError> {
+        if circle.radius <= 0 || rho <= 0 {
+            return Err(DubinsError::InvalidRadius);
+        }
+        if !options.allow_clockwise && !options.allow_counterclockwise {
+            return Err(DubinsError::NoPath);
+        }
+
+        let start_point = FixedVec2::new(start.x, start.y);
+        let angles = tangent_angles_point_circle(start_point, circle, &self.dtrig);
+        let mut best: Option<PoseToCircleResult> = None;
+        for angle in angles {
+            if options.allow_clockwise {
+                best = select_best_pose_to_circle(
+                    best,
+                    self,
+                    start,
+                    circle,
+                    angle,
+                    TangentDirection::Clockwise,
+                    rho,
+                );
+            }
+            if options.allow_counterclockwise {
+                best = select_best_pose_to_circle(
+                    best,
+                    self,
+                    start,
+                    circle,
+                    angle,
+                    TangentDirection::Counterclockwise,
+                    rho,
+                );
+            }
+        }
+        best.ok_or(DubinsError::NoPath)
+    }
+
+    /// Shortest path from a circle tangent start to a pose (analytic tangents).
+    pub fn shortest_path_circle_to_pose_analytic(
+        &self,
+        circle: CircleManifold,
+        end: Pose,
+        rho: Fixed,
+        options: ManifoldSearchOptions,
+    ) -> Result<CircleToPoseResult, DubinsError> {
+        if circle.radius <= 0 || rho <= 0 {
+            return Err(DubinsError::InvalidRadius);
+        }
+        if !options.allow_clockwise && !options.allow_counterclockwise {
+            return Err(DubinsError::NoPath);
+        }
+
+        let end_point = FixedVec2::new(end.x, end.y);
+        let angles = tangent_angles_point_circle(end_point, circle, &self.dtrig);
+        let mut best: Option<CircleToPoseResult> = None;
+        for angle in angles {
+            if options.allow_clockwise {
+                best = select_best_circle_to_pose(
+                    best,
+                    self,
+                    circle,
+                    end,
+                    angle,
+                    TangentDirection::Clockwise,
+                    rho,
+                );
+            }
+            if options.allow_counterclockwise {
+                best = select_best_circle_to_pose(
+                    best,
+                    self,
+                    circle,
+                    end,
+                    angle,
+                    TangentDirection::Counterclockwise,
+                    rho,
+                );
+            }
+        }
+        best.ok_or(DubinsError::NoPath)
+    }
+
+    /// Shortest path between two circular manifolds (analytic tangents).
+    pub fn shortest_path_circle_to_circle_analytic(
+        &self,
+        start_circle: CircleManifold,
+        end_circle: CircleManifold,
+        rho: Fixed,
+        options: ManifoldSearchOptions,
+    ) -> Result<CircleToCircleResult, DubinsError> {
+        if start_circle.radius <= 0 || end_circle.radius <= 0 || rho <= 0 {
+            return Err(DubinsError::InvalidRadius);
+        }
+        if !options.allow_clockwise && !options.allow_counterclockwise {
+            return Err(DubinsError::NoPath);
+        }
+
+        let tangents = circle_circle_tangents(start_circle, end_circle);
+        let mut best: Option<CircleToCircleResult> = None;
+
+        for tangent in tangents {
+            if !dir_allowed(tangent.start_direction, options)
+                || !dir_allowed(tangent.end_direction, options)
+            {
+                continue;
+            }
+
+            let line_dx = tangent.end_point.x - tangent.start_point.x;
+            let line_dy = tangent.end_point.y - tangent.start_point.y;
+            let start_heading = atan2_mrad(line_dy, line_dx, &self.dtrig);
+            let end_heading = start_heading;
+            let start_pose = Pose::new_fixed(tangent.start_point.x, tangent.start_point.y, start_heading);
+            let end_pose = Pose::new_fixed(tangent.end_point.x, tangent.end_point.y, end_heading);
+            let start_radial = FixedVec2::new(
+                tangent.start_point.x - start_circle.center.x,
+                tangent.start_point.y - start_circle.center.y,
+            );
+            let end_radial = FixedVec2::new(
+                tangent.end_point.x - end_circle.center.x,
+                tangent.end_point.y - end_circle.center.y,
+            );
+            let start_angle = atan2_mrad(start_radial.y, start_radial.x, &self.dtrig);
+            let end_angle = atan2_mrad(end_radial.y, end_radial.x, &self.dtrig);
+            let path = self.shortest_path(start_pose, end_pose, rho).ok();
+            if let Some(path) = path {
+                let candidate = CircleToCircleResult {
+                    path,
+                    start_pose,
+                    end_pose,
+                    start_angle,
+                    end_angle,
+                    start_direction: tangent.start_direction,
+                    end_direction: tangent.end_direction,
+                };
+                best = match best {
+                    None => Some(candidate),
+                    Some(current) => {
+                        if candidate.path.total_length < current.path.total_length {
+                            Some(candidate)
+                        } else {
+                            Some(current)
+                        }
+                    }
+                };
+            }
+        }
+
+        best.ok_or(DubinsError::NoPath)
+    }
+}
+
+/// Result for pose-to-circle searches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoseToCircleResult {
+    pub path: DubinsPath,
+    pub end_pose: Pose,
+    pub end_angle: Angle,
+    pub end_direction: TangentDirection,
+}
+
+/// Result for circle-to-pose searches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CircleToPoseResult {
+    pub path: DubinsPath,
+    pub start_pose: Pose,
+    pub start_angle: Angle,
+    pub start_direction: TangentDirection,
+}
+
+/// Result for circle-to-circle searches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CircleToCircleResult {
+    pub path: DubinsPath,
+    pub start_pose: Pose,
+    pub end_pose: Pose,
+    pub start_angle: Angle,
+    pub end_angle: Angle,
+    pub start_direction: TangentDirection,
+    pub end_direction: TangentDirection,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CircleTangentCandidate {
+    start_point: FixedVec2,
+    end_point: FixedVec2,
+    start_direction: TangentDirection,
+    end_direction: TangentDirection,
+}
+
+fn dir_allowed(direction: TangentDirection, options: ManifoldSearchOptions) -> bool {
+    match direction {
+        TangentDirection::Clockwise => options.allow_clockwise,
+        TangentDirection::Counterclockwise => options.allow_counterclockwise,
+    }
+}
+
+fn circle_tangent_pose(
+    circle: CircleManifold,
+    angle: Angle,
+    direction: TangentDirection,
+    dtrig: &DTrig,
+) -> Pose {
+    let point = fixed_from_angle(circle.center, circle.radius, angle, dtrig);
+    let heading = match direction {
+        TangentDirection::Clockwise => mod2pi(angle as i64 - HALF_PI_MRAD as i64),
+        TangentDirection::Counterclockwise => mod2pi(angle as i64 + HALF_PI_MRAD as i64),
+    };
+    Pose::new_fixed(point.x, point.y, heading)
+}
+
+fn tangent_angles_point_circle(
+    point: FixedVec2,
+    circle: CircleManifold,
+    dtrig: &DTrig,
+) -> Vec<Angle> {
+    let dx = point.x - circle.center.x;
+    let dy = point.y - circle.center.y;
+    let distance = isqrt_i128((dx as i128) * (dx as i128) + (dy as i128) * (dy as i128));
+    if distance == 0 || distance < circle.radius {
+        return Vec::new();
+    }
+
+    let ratio = scaled_ratio_1000(circle.radius, distance);
+    let alpha = match arccos_mrad(ratio, dtrig) {
+        Some(value) => value,
+        None => return Vec::new(),
+    };
+    let theta = atan2_mrad(dy, dx, dtrig);
+
+    let mut angles = Vec::new();
+    let angle_a = mod2pi(theta as i64 + alpha as i64);
+    angles.push(angle_a);
+    if alpha != 0 {
+        let angle_b = mod2pi(theta as i64 - alpha as i64);
+        angles.push(angle_b);
+    }
+    angles
+}
+
+fn scaled_ratio_1000(numer: Fixed, denom: Fixed) -> i64 {
+    if denom <= 0 {
+        return 0;
+    }
+    let value = (numer as i128) * 1000 / (denom as i128);
+    if value > i64::MAX as i128 {
+        i64::MAX
+    } else if value < i64::MIN as i128 {
+        i64::MIN
+    } else {
+        value as i64
+    }
+}
+
+fn tangent_direction(radial: FixedVec2, tangent: FixedVec2) -> TangentDirection {
+    let cross = (radial.x as i128) * (tangent.y as i128) - (radial.y as i128) * (tangent.x as i128);
+    if cross >= 0 {
+        TangentDirection::Counterclockwise
+    } else {
+        TangentDirection::Clockwise
+    }
+}
+
+fn circle_circle_tangents(
+    start_circle: CircleManifold,
+    end_circle: CircleManifold,
+) -> Vec<CircleTangentCandidate> {
+    let dx = end_circle.center.x - start_circle.center.x;
+    let dy = end_circle.center.y - start_circle.center.y;
+    let d2 = (dx as i128) * (dx as i128) + (dy as i128) * (dy as i128);
+    if d2 == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    let signs = [1i64, -1i64];
+    for s in signs {
+        let r = end_circle.radius - s * start_circle.radius;
+        let h2 = d2 - (r as i128) * (r as i128);
+        if h2 < 0 {
+            continue;
+        }
+        let h = isqrt_i128(h2);
+        let t_values: &[i64] = if h2 == 0 { &[1] } else { &[-1, 1] };
+        for t in t_values {
+            let vx_num = (dx as i128) * (r as i128) + (-dy as i128) * (h as i128) * (*t as i128);
+            let vy_num = (dy as i128) * (r as i128) + (dx as i128) * (h as i128) * (*t as i128);
+
+            let start_x = start_circle.center.x + div_i128((start_circle.radius as i128) * vx_num, d2);
+            let start_y = start_circle.center.y + div_i128((start_circle.radius as i128) * vy_num, d2);
+            let end_x = end_circle.center.x + div_i128((end_circle.radius as i128) * vx_num, d2);
+            let end_y = end_circle.center.y + div_i128((end_circle.radius as i128) * vy_num, d2);
+
+            let start_point = FixedVec2::new(start_x, start_y);
+            let end_point = FixedVec2::new(end_x, end_y);
+            let line_dir = FixedVec2::new(end_x - start_x, end_y - start_y);
+            if line_dir.x == 0 && line_dir.y == 0 {
+                continue;
+            }
+
+            let start_radial = FixedVec2::new(start_x - start_circle.center.x, start_y - start_circle.center.y);
+            let end_radial = FixedVec2::new(end_x - end_circle.center.x, end_y - end_circle.center.y);
+            let start_direction = tangent_direction(start_radial, line_dir);
+            let end_direction = tangent_direction(end_radial, line_dir);
+
+            candidates.push(CircleTangentCandidate {
+                start_point,
+                end_point,
+                start_direction,
+                end_direction,
+            });
+        }
+    }
+    candidates
+}
+
+fn div_i128(numer: i128, denom: i128) -> i64 {
+    if denom == 0 {
+        return 0;
+    }
+    (numer / denom) as i64
+}
+
+fn select_best_pose_to_circle(
+    best: Option<PoseToCircleResult>,
+    ctx: &DubinsContext,
+    start: Pose,
+    circle: CircleManifold,
+    angle: Angle,
+    direction: TangentDirection,
+    rho: Fixed,
+) -> Option<PoseToCircleResult> {
+    let end_pose = circle_tangent_pose(circle, angle, direction, &ctx.dtrig);
+    let path = ctx.shortest_path(start, end_pose, rho).ok()?;
+    let candidate = PoseToCircleResult {
+        path,
+        end_pose,
+        end_angle: angle,
+        end_direction: direction,
+    };
+    match best {
+        None => Some(candidate),
+        Some(current) => {
+            if candidate.path.total_length < current.path.total_length {
+                Some(candidate)
+            } else {
+                Some(current)
+            }
+        }
+    }
+}
+
+fn select_best_circle_to_pose(
+    best: Option<CircleToPoseResult>,
+    ctx: &DubinsContext,
+    circle: CircleManifold,
+    end: Pose,
+    angle: Angle,
+    direction: TangentDirection,
+    rho: Fixed,
+) -> Option<CircleToPoseResult> {
+    let start_pose = circle_tangent_pose(circle, angle, direction, &ctx.dtrig);
+    let path = ctx.shortest_path(start_pose, end, rho).ok()?;
+    let candidate = CircleToPoseResult {
+        path,
+        start_pose,
+        start_angle: angle,
+        start_direction: direction,
+    };
+    match best {
+        None => Some(candidate),
+        Some(current) => {
+            if candidate.path.total_length < current.path.total_length {
+                Some(candidate)
+            } else {
+                Some(current)
+            }
+        }
+    }
+}
+
+fn select_best_circle_to_circle(
+    best: Option<CircleToCircleResult>,
+    ctx: &DubinsContext,
+    start_circle: CircleManifold,
+    end_circle: CircleManifold,
+    start_angle: Angle,
+    end_angle: Angle,
+    start_direction: TangentDirection,
+    end_direction: TangentDirection,
+    rho: Fixed,
+) -> Option<CircleToCircleResult> {
+    let start_pose = circle_tangent_pose(start_circle, start_angle, start_direction, &ctx.dtrig);
+    let end_pose = circle_tangent_pose(end_circle, end_angle, end_direction, &ctx.dtrig);
+    let path = ctx.shortest_path(start_pose, end_pose, rho).ok()?;
+    let candidate = CircleToCircleResult {
+        path,
+        start_pose,
+        end_pose,
+        start_angle,
+        end_angle,
+        start_direction,
+        end_direction,
+    };
+    match best {
+        None => Some(candidate),
+        Some(current) => {
+            if candidate.path.total_length < current.path.total_length {
+                Some(candidate)
+            } else {
+                Some(current)
+            }
+        }
     }
 }
 
