@@ -139,7 +139,7 @@ pub struct DubinsSegment {
 }
 
 /// A deterministic Dubins path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DubinsPath {
     /// Start pose for this path.
     pub start: Pose,
@@ -540,8 +540,109 @@ impl DubinsContext {
         best.ok_or(DubinsError::NoPath)
     }
 
-    /// Shortest path between two circular manifolds (analytic tangents).
-    pub fn shortest_path_circle_to_circle_analytic(
+    /// Robust circle-to-circle solver: analytic tangents when possible, otherwise coarse+refine search.
+    pub fn shortest_path_circle_to_circle(
+        &self,
+        start_circle: CircleManifold,
+        end_circle: CircleManifold,
+        rho: Fixed,
+        options: ManifoldSearchOptions,
+    ) -> Result<CircleToCircleResult, DubinsError> {
+        // First try analytic tangents (fast, few candidates).
+        if let Ok(res) = self.shortest_path_circle_to_circle_analytic(start_circle, end_circle, rho, options) {
+            return Ok(res);
+        }
+        // Fallback that works even when circles overlap / nest.
+        self.shortest_path_circle_to_circle_fallback_1d_local(start_circle, end_circle, rho, options)
+    }
+
+    /// Fast, reliable "good enough" pose->circle join. Avoids loopdy-loops.
+    pub fn fast_pose_to_circle_join(
+        &self,
+        start: Pose,
+        circle: CircleManifold,
+        rho: Fixed,
+        clockwise: bool,
+    ) -> Result<PoseToCircleResult, DubinsError> {
+        if circle.radius <= 0 || rho <= 0 {
+            return Err(DubinsError::InvalidRadius);
+        }
+
+        let from = FixedVec2::new(start.x, start.y);
+        let dx = from.x - circle.center.x;
+        let dy = from.y - circle.center.y;
+
+        // If exactly at center, choose something stable: use heading as angle.
+        let base_angle = if dx != 0 || dy != 0 {
+            atan2_mrad(dy, dx, &self.dtrig)
+        } else {
+            start.heading
+        };
+
+        let target_point = fixed_from_angle(circle.center, circle.radius, base_angle, &self.dtrig);
+        let target_heading = if clockwise {
+            normalize_angle(base_angle - HALF_PI_MRAD)
+        } else {
+            normalize_angle(base_angle + HALF_PI_MRAD)
+        };
+
+        let end_pose = Pose::new_fixed(target_point.x, target_point.y, target_heading);
+
+        let path = self.shortest_path(start, end_pose, rho)?;
+
+        // Guard against "obviously dumb" solutions.
+        let d = from.distance(target_point).max(1);
+        let k: i64 = 3;                // max multiple of straight distance
+        let b: i64 = 2 * rho;          // turning overhead budget
+        if path.total_length > k * d + b {
+            // Fallback: try the other orbit direction heading at same point (often removes loops)
+            let alt_heading = if clockwise {
+                normalize_angle(base_angle + HALF_PI_MRAD)
+            } else {
+                normalize_angle(base_angle - HALF_PI_MRAD)
+            };
+            let alt_end = Pose::new_fixed(target_point.x, target_point.y, alt_heading);
+            if let Ok(alt_path) = self.shortest_path(start, alt_end, rho) {
+                // pick the shorter that doesn't exceed guard, otherwise pick shorter anyway
+                let alt_ok = alt_path.total_length <= k * d + b;
+                let orig_ok = path.total_length <= k * d + b;
+                let chosen = if alt_ok && !orig_ok {
+                    alt_path
+                } else if orig_ok && !alt_ok {
+                    path
+                } else if alt_path.total_length < path.total_length {
+                    alt_path
+                } else {
+                    path
+                };
+                let chosen_end = if chosen.total_length == alt_path.total_length { alt_end } else { end_pose };
+                return Ok(PoseToCircleResult {
+                    path: chosen,
+                    end_pose: chosen_end,
+                    end_angle: base_angle,
+                    end_direction: if chosen_end.heading == target_heading {
+                        if clockwise { TangentDirection::Clockwise } else { TangentDirection::Counterclockwise }
+                    } else {
+                        if clockwise { TangentDirection::Counterclockwise } else { TangentDirection::Clockwise }
+                    },
+                });
+            }
+        }
+
+        Ok(PoseToCircleResult {
+            path,
+            end_pose,
+            end_angle: base_angle,
+            end_direction: if clockwise {
+                TangentDirection::Clockwise
+            } else {
+                TangentDirection::Counterclockwise
+            },
+        })
+    }
+
+    /// Fallback: sample start angle (1D); for each, do coarse end-angle scan + local refinement.
+    fn shortest_path_circle_to_circle_fallback_1d_local(
         &self,
         start_circle: CircleManifold,
         end_circle: CircleManifold,
@@ -551,72 +652,239 @@ impl DubinsContext {
         if start_circle.radius <= 0 || end_circle.radius <= 0 || rho <= 0 {
             return Err(DubinsError::InvalidRadius);
         }
+        if options.angle_step <= 0 {
+            return Err(DubinsError::InvalidStep);
+        }
         if (!options.start_allow_clockwise && !options.start_allow_counterclockwise)
             || (!options.end_allow_clockwise && !options.end_allow_counterclockwise)
         {
             return Err(DubinsError::NoPath);
         }
 
-        let tangents = circle_circle_tangents(start_circle, end_circle);
-        if tangents.is_empty() {
-            return self.shortest_path_circle_to_circle_grid(
-                start_circle,
-                end_circle,
-                rho,
-                options,
-            );
-        }
+        let dirs = [TangentDirection::Clockwise, TangentDirection::Counterclockwise];
+
+        // Coarse end scan step. Make it larger than start step to keep work bounded.
+        // You can tune these; these defaults keep runtime modest.
+        let start_step = options.angle_step.max(10) as i32;
+        let end_coarse_step: i32 = (options.angle_step * 8).max(80);   // e.g. 80 mrad ≈ 4.6°
+        let end_refine_step: i32 = (options.angle_step * 2).max(20);   // e.g. 20 mrad ≈ 1.1°
+        let refine_window: i32 = (end_coarse_step * 2).max(200);       // search ±window around best coarse angle
+
         let mut best: Option<CircleToCircleResult> = None;
 
-        for tangent in tangents {
-            if !start_dir_allowed(tangent.start_direction, options)
-                || !end_dir_allowed(tangent.end_direction, options)
-            {
-                continue;
-            }
+        // Outer loop: start angle only (1D)
+        let mut start_angle = 0i32;
+        while start_angle < TAU_MRAD as i32 {
+            for &start_dir in &dirs {
+                if !start_dir_allowed(start_dir, options) {
+                    continue;
+                }
 
-            let line_dx = tangent.end_point.x - tangent.start_point.x;
-            let line_dy = tangent.end_point.y - tangent.start_point.y;
-            let start_heading = atan2_mrad(line_dy, line_dx, &self.dtrig);
-            let end_heading = start_heading;
-            let start_pose = Pose::new_fixed(tangent.start_point.x, tangent.start_point.y, start_heading);
-            let end_pose = Pose::new_fixed(tangent.end_point.x, tangent.end_point.y, end_heading);
-            let start_radial = FixedVec2::new(
-                tangent.start_point.x - start_circle.center.x,
-                tangent.start_point.y - start_circle.center.y,
-            );
-            let end_radial = FixedVec2::new(
-                tangent.end_point.x - end_circle.center.x,
-                tangent.end_point.y - end_circle.center.y,
-            );
-            let start_angle = atan2_mrad(start_radial.y, start_radial.x, &self.dtrig);
-            let end_angle = atan2_mrad(end_radial.y, end_radial.x, &self.dtrig);
-            let path = self.shortest_path(start_pose, end_pose, rho).ok();
-            if let Some(path) = path {
-                let candidate = CircleToCircleResult {
-                    path,
-                    start_pose,
-                    end_pose,
-                    start_angle,
-                    end_angle,
-                    start_direction: tangent.start_direction,
-                    end_direction: tangent.end_direction,
-                };
-                best = match best {
-                    None => Some(candidate),
-                    Some(current) => {
-                        if candidate.path.total_length < current.path.total_length {
-                            Some(candidate)
-                        } else {
-                            Some(current)
+                // For this start pose, find best end_angle via coarse scan first.
+                let mut best_for_start: Option<(Angle, TangentDirection, Fixed)> = None;
+
+                let mut end_angle = 0i32;
+                while end_angle < TAU_MRAD as i32 {
+                    for &end_dir in &dirs {
+                        if !end_dir_allowed(end_dir, options) {
+                            continue;
+                        }
+                        if let Some(candidate) = select_best_circle_to_circle(
+                            None,
+                            self,
+                            start_circle,
+                            end_circle,
+                            start_angle as Angle,
+                            end_angle as Angle,
+                            start_dir,
+                            end_dir,
+                            rho,
+                        ) {
+                            let len = candidate.path.total_length;
+                            match best_for_start {
+                                None => best_for_start = Some((end_angle as Angle, end_dir, len)),
+                                Some((_, _, best_len)) => {
+                                    if len < best_len {
+                                        best_for_start = Some((end_angle as Angle, end_dir, len));
+                                    }
+                                }
+                            }
                         }
                     }
+                    end_angle += end_coarse_step;
+                }
+
+                // If coarse found nothing, skip refinement.
+                let Some((coarse_best_end_angle, coarse_best_end_dir, _)) = best_for_start else {
+                    continue;
                 };
+
+                // Local refinement around best coarse angle.
+                let center = coarse_best_end_angle as i32;
+                let mut local_best: Option<CircleToCircleResult> = None;
+
+                let mut delta = -refine_window;
+                while delta <= refine_window {
+                    let ea = mod2pi((center + delta) as i64);
+                    for &end_dir in &dirs {
+                        if !end_dir_allowed(end_dir, options) {
+                            continue;
+                        }
+                        // Optional: bias toward the coarse best direction first.
+                        // (Still tries both to avoid missing shorter solutions.)
+                        local_best = select_best_circle_to_circle(
+                            local_best,
+                            self,
+                            start_circle,
+                            end_circle,
+                            start_angle as Angle,
+                            ea,
+                            start_dir,
+                            end_dir,
+                            rho,
+                        );
+                    }
+                    delta += end_refine_step;
+                }
+
+                // Merge best for this start into global best.
+                if let Some(candidate) = local_best {
+                    best = match best {
+                        None => Some(candidate),
+                        Some(current) => {
+                            if candidate.path.total_length < current.path.total_length {
+                                Some(candidate)
+                            } else {
+                                Some(current)
+                            }
+                        }
+                    };
+                }
             }
+
+            start_angle += start_step;
         }
 
         best.ok_or(DubinsError::NoPath)
     }
+
+    /// Shortest path between two circular manifolds (analytic tangents only, no fallback).
+pub fn shortest_path_circle_to_circle_analytic(
+    &self,
+    start_circle: CircleManifold,
+    end_circle: CircleManifold,
+    rho: Fixed,
+    options: ManifoldSearchOptions,
+) -> Result<CircleToCircleResult, DubinsError> {
+    if start_circle.radius <= 0 || end_circle.radius <= 0 || rho <= 0 {
+        return Err(DubinsError::InvalidRadius);
+    }
+    if (!options.start_allow_clockwise && !options.start_allow_counterclockwise)
+        || (!options.end_allow_clockwise && !options.end_allow_counterclockwise)
+    {
+        return Err(DubinsError::NoPath);
+    }
+
+    // Helper: signed smallest angle diff in milliradians, in [-PI, +PI].
+    fn signed_angle_diff(a: Angle, b: Angle) -> i32 {
+        let mut d = a as i32 - b as i32;
+        let tau = TAU_MRAD as i32;
+        let pi = PI_MRAD as i32;
+        d %= tau;
+        if d > pi {
+            d -= tau;
+        } else if d < -pi {
+            d += tau;
+        }
+        d
+    }
+
+    // Helper: tangent heading for a circle at radial angle, given orbit direction.
+    fn tangent_heading(angle: Angle, dir: TangentDirection) -> Angle {
+        match dir {
+            TangentDirection::Clockwise => normalize_angle(angle - HALF_PI_MRAD),
+            TangentDirection::Counterclockwise => normalize_angle(angle + HALF_PI_MRAD),
+        }
+    }
+
+    // Small tolerance for fixed-point/atan2 quantization (milliradians).
+    const HEADING_EPS: i32 = 3;
+
+    let tangents = circle_circle_tangents(start_circle, end_circle);
+    if tangents.is_empty() {
+        return Err(DubinsError::NoPath);
+    }
+
+    let mut best: Option<CircleToCircleResult> = None;
+
+    for t in tangents {
+        if !start_dir_allowed(t.start_direction, options) || !end_dir_allowed(t.end_direction, options) {
+            continue;
+        }
+
+        // Compute angles on each circle from tangent points.
+        let start_radial = FixedVec2::new(
+            t.start_point.x - start_circle.center.x,
+            t.start_point.y - start_circle.center.y,
+        );
+        let end_radial = FixedVec2::new(
+            t.end_point.x - end_circle.center.x,
+            t.end_point.y - end_circle.center.y,
+        );
+        let start_angle = atan2_mrad(start_radial.y, start_radial.x, &self.dtrig);
+        let end_angle = atan2_mrad(end_radial.y, end_radial.x, &self.dtrig);
+
+        // Required headings for orbit tangency at those angles/directions.
+        let start_req_h = tangent_heading(start_angle, t.start_direction);
+        let end_req_h = tangent_heading(end_angle, t.end_direction);
+
+        // Travel direction along the tangent line (start -> end).
+        let line_dx = t.end_point.x - t.start_point.x;
+        let line_dy = t.end_point.y - t.start_point.y;
+        if line_dx == 0 && line_dy == 0 {
+            continue;
+        }
+        let line_h = atan2_mrad(line_dy, line_dx, &self.dtrig);
+
+        // Enforce that the travel direction matches BOTH required tangent headings.
+        // If it doesn't, this tangent is the "wrong orientation" for the requested CW/CCW join
+        // and will cause big corrective maneuvers (loops).
+        if signed_angle_diff(line_h, start_req_h).abs() > HEADING_EPS {
+            continue;
+        }
+        if signed_angle_diff(line_h, end_req_h).abs() > HEADING_EPS {
+            continue;
+        }
+
+        let start_pose = Pose::new_fixed(t.start_point.x, t.start_point.y, start_req_h);
+        let end_pose = Pose::new_fixed(t.end_point.x, t.end_point.y, end_req_h);
+
+        if let Ok(path) = self.shortest_path(start_pose, end_pose, rho) {
+            let candidate = CircleToCircleResult {
+                path,
+                start_pose,
+                end_pose,
+                start_angle,
+                end_angle,
+                start_direction: t.start_direction,
+                end_direction: t.end_direction,
+            };
+            best = match best {
+                None => Some(candidate),
+                Some(current) => {
+                    if candidate.path.total_length < current.path.total_length {
+                        Some(candidate)
+                    } else {
+                        Some(current)
+                    }
+                }
+            };
+        }
+    }
+
+    best.ok_or(DubinsError::NoPath)
+}
+
 }
 
 /// Result for pose-to-circle searches.
